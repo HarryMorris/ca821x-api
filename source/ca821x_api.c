@@ -118,6 +118,9 @@ const uint8_t sync_pairings[23] = {
 /** Variable for storing callback routines registered by the user */
 static struct ca821x_api_callbacks callbacks;
 
+static uint8_t extaddr[8] = { 0 }; /**< Mirrors nsIEEEAddress in the PIB */
+static uint16_t shortaddr = 0xFFFF; /**< Mirrors macShortAddress in the PIB */
+
 /******************************************************************************/
 /***************************************************************************//**
  * \brief Function pointer for downstream api interface.
@@ -660,6 +663,14 @@ uint8_t MLME_SET_request_sync(
 
 	if (Response.CommandId != SPI_MLME_SET_CONFIRM)
 		return MAC_SYSTEM_ERROR;
+
+	if (SIMPLECNF.Status == MAC_SUCCESS) {
+		if (PIBAttribute == macShortAddress) {
+			shortaddr = *(uint16_t*)pPIBAttributeValue;
+		} else if (PIBAttribute == nsIEEEAddress) {
+			memcpy(extaddr, pPIBAttributeValue, 8);
+		}
+	}
 
 	return SIMPLECNF.Status;
 	#undef SETREQ
@@ -1453,6 +1464,65 @@ void ca821x_register_callbacks(struct ca821x_api_callbacks *in_callbacks)
 
 /******************************************************************************/
 /***************************************************************************//**
+ * \brief Checks a data indication to ensure that its destination address
+ *        matches the address of this node.
+ *******************************************************************************
+ * \param *ind - Data indication parameter set
+ *******************************************************************************
+ * \return Result of address check
+ *         0: Success
+ *         -1: Address mismatch (non-unix)
+ *         -EFAULT: Address mismatch (unix)
+ *******************************************************************************
+ ******************************************************************************/
+static int check_data_ind_destaddr(struct MCPS_DATA_indication_pset *ind)
+{
+  int i;
+	if (ind->Dst.AddressMode == MAC_MODE_SHORT_ADDR) {
+		if (
+			*((uint16_t*)ind->Dst.Address) != MAC_BROADCAST_ADDRESS &&
+			memcmp(ind->Dst.Address, &shortaddr, 2) &&
+			shortaddr != 0xFFFF) {
+#ifdef __unix__
+			return -EFAULT;
+#else
+			return -1;
+#endif
+		}
+	} else if (ind->Dst.AddressMode == MAC_MODE_LONG_ADDR) {
+    if (memcmp(ind->Dst.Address, extaddr, 8)) {
+      for (i = 0; i < 9; i++) {
+        if (i == 8)
+          return 0;
+        else if (extaddr[i] != 0)
+          break;
+      }
+#ifdef __unix__
+			return -EFAULT;
+#else
+			return -1;
+#endif
+		}
+	}
+	return 0;
+}
+
+/******************************************************************************/
+/***************************************************************************//**
+ * \brief Checks an associate confirm for an assigned short address
+ *******************************************************************************
+ * \param *assoc_cnf - Associate confirm parameter set
+ *******************************************************************************
+ ******************************************************************************/
+void get_assoccnf_shortaddr(struct MLME_ASSOCIATE_confirm_pset *assoc_cnf)
+{
+	if (GETLE16(assoc_cnf->AssocShortAddress) != 0xFFFF) {
+		shortaddr = GETLE16(assoc_cnf->AssocShortAddress);
+	}
+}
+
+/******************************************************************************/
+/***************************************************************************//**
  * \brief Call the relevant callback routine if populated or the
  *        generic_dispatch for a received command.
  *******************************************************************************
@@ -1471,6 +1541,12 @@ int ca821x_downstream_dispatch(const uint8_t *buf, size_t len)
 	/* call appropriate api upstream callback */
 	switch (buf[0]) {
 	case SPI_MCPS_DATA_INDICATION:
+		ret = check_data_ind_destaddr(
+			(struct MCPS_DATA_indication_pset*)(buf + 2)
+		);
+		if (ret) {
+			return ret;
+		}
 		if (callbacks.MCPS_DATA_indication) {
 			return callbacks.MCPS_DATA_indication(
 				(struct MCPS_DATA_indication_pset*)(buf + 2)
@@ -1492,6 +1568,7 @@ int ca821x_downstream_dispatch(const uint8_t *buf, size_t len)
 		}
 		break;
 	case SPI_MLME_ASSOCIATE_CONFIRM:
+		get_assoccnf_shortaddr((struct MLME_ASSOCIATE_confirm_pset*)(buf + 2));
 		if (callbacks.MLME_ASSOCIATE_confirm) {
 			return callbacks.MLME_ASSOCIATE_confirm(
 				(struct MLME_ASSOCIATE_confirm_pset*)(buf + 2)
